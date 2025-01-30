@@ -80,34 +80,6 @@ def get_current_user(state: AgentState, config: RunnableConfig):
         session.close()
     return state
 
-def check_relevance(state: AgentState, config: RunnableConfig):
-    question = state.question
-    schema = get_database_schema(engine)
-    print(f"[DEBUG] Checking relevance of the question: {question}")
-    system = f"""
-    You are an assistant that determines whether a given question is related to the following database schema.
-
-    Schema:
-    {schema}
-
-    Respond with only \"relevant\" or \"not_relevant\".
-    """
-    human = f"Question: {question}"
-    check_prompt = ChatPromptTemplate.from_messages([
-        ("system", system),
-        ("human", human),
-    ])
-    llm = ChatOpenAI(temperature=0)
-    structured_llm = llm.with_structured_output(CheckRelevance)
-    try:
-        relevance_checker = check_prompt | structured_llm
-        relevance = relevance_checker.invoke({})
-        state.relevance = relevance.relevance
-        print(f"[DEBUG] Relevance determined: {state.relevance}")
-    except Exception as e:
-        print(f"[ERROR] Error during relevance check: {e}")
-        state.relevance = "not_relevant"
-    return state
 
 def convert_nl_to_sql(state: AgentState, config: RunnableConfig):
     if state.relevance != "relevant":
