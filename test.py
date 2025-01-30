@@ -2,170 +2,653 @@ import os
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Float
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
-from sqlalchemy import text, inspect
 from langchain_core.runnables.config import RunnableConfig
-from langchain_core.prompts.chat import ChatPromptTemplate
-from langchain_core.output_parsers.string import StrOutputParser
-from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
+from azure.identity import DefaultAzureCredential
+import matplotlib.pyplot as plt
+import pandas as pd
+import networkx as nx
+from chromadb import PersistentClient
+from chromadb.utils.embedding_functions import EmbeddingFunction
+from transformers import AutoTokenizer, AutoModel
+from typing import List, Optional, Dict
+import torch
+import json
+from pydantic import BaseModel, Field, ValidationError
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts.chat import SystemMessage, HumanMessage
+from langchain_openai import AzureChatOpenAI
+from langgraph.graph import StateGraph, END
+from sqlalchemy import text, inspect
 
 # Load environment variables
 load_dotenv()
 
+# Database Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///example.db")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Define database models
+# ChromaDB Configuration
+CHROMA_DB_DIR = "./chroma_db"
+COLLECTION_NAME = "schema_embeddings"
+EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
+
+# SQLAlchemy Base Model
 Base = declarative_base()
 
+# -------------------------- Database Table Definitions -------------------------- #
+
 class User(Base):
+    """Represents a user in the system."""
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
     age = Column(Integer)
     email = Column(String, unique=True, index=True)
+    orders = relationship("Order", back_populates="user")
 
-class Food(Base):
-    __tablename__ = "food"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True, index=True)
-    price = Column(Float)
 
-class Order(Base):
-    __tablename__ = "orders"
-    id = Column(Integer, primary_key=True, index=True)
-    food_id = Column(Integer, ForeignKey("food.id"))
-    user_id = Column(Integer, ForeignKey("users.id"))
+# -------------------------- Agent State Definition -------------------------- #
 
-# Define agent state
 class AgentState(BaseModel):
+    question: str
+    sql_query: Optional[str] = None
+    query_result: Optional[str] = None
+    query_rows: List[dict] = []
     current_user: str = ""
-    question: str = ""
+    attempts: int = 0
     relevance: str = ""
-    sql_query: str = ""
-    query_rows: list = []
-    query_result: str = ""
+    sql_error: bool = False
+    context: List[str] = []
+    chart_type: Optional[str] = None
+    chart_title: Optional[str] = None
+
+MAX_RETRIES = 3
+
+
+# -------------------------- Schema Extraction and Processing -------------------------- #
+from typing import Dict, List
+import torch
+
+
+
+class ThaiBGEEmbeddingFunction(EmbeddingFunction):
+    """
+    Embedding function with proper pooling and Thai language support
+    """
+    def __init__(self, model_name= "BAAI/bge-m3"):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.eval()  # Disable dropout for evaluation
+
+    def __call__(self, texts: List[str]) -> List[List[float]]:
+        """
+        Generate embeddings for input texts
+        Args:
+            texts (List[str]): List of strings to embed
+        Returns:
+            List[List[float]]: List of embeddings
+        """
+        if isinstance(texts, str):  # Ensure input is a list
+            texts = [texts]
+        
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=512
+        )
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            embeddings = outputs.last_hidden_state[:, 0]  # CLS pooling
+        return embeddings.cpu().numpy().tolist()
+
+def process_schema_to_graph_and_embeddings(schema: Dict, chroma_collection, embedding_model) -> nx.DiGraph:
+    """
+    Process database schema into a graph structure and store embeddings in ChromaDB,
+    using M-Schema format for enhanced metadata.
+    """
+    graph = nx.DiGraph()
+    entries = []
+
+    for table_name, details in schema.items():
+        # Add table as a node with enriched metadata
+        graph.add_node(
+            table_name,
+            type="table",
+            description=details.get("description", ""),
+            primary_keys=details.get("primary_keys", []),
+            examples=details.get("examples", {})
+        )
+
+        # Process columns with M-Schema metadata
+        for column in details["columns"]:
+            column_id = f"{table_name}.{column['name']}"
+            
+            # Safely get examples for the column and serialize them
+            examples = column.get("examples", [])
+            examples_serialized = ", ".join(map(str, examples)) if examples else "None"
+            
+            graph.add_node(
+                column_id,
+                type="column",
+                table=table_name,
+                data_type=column["type"],
+                primary_key=column.get("primary_key", False),
+                examples=examples_serialized  # Store serialized examples
+            )
+            graph.add_edge(table_name, column_id, relation="has_column")
+
+            # Add column embedding entry
+            column_text = (
+                f"Column: {column['name']} ({column['type']}), "
+                f"Primary Key: {column.get('primary_key', False)}, "
+                f"Examples: {examples_serialized}"
+            )
+            embedding = embedding_model([column_text])[0]
+
+            entries.append({
+                "id": column_id,
+                "text": column_text,
+                "embedding": embedding,
+                "metadata": {
+                    "type": "column",
+                    "table": table_name,
+                    "data_type": column["type"],
+                    "primary_key": column.get("primary_key", False),
+                    "examples": examples_serialized  # Store serialized examples in metadata
+                }
+            })
+
+        # Process relationships with enriched metadata
+        for relation in details.get("relationships", []):
+            rel_id = f"{table_name}.{relation['source_column']}->{relation['target_table']}.{relation['target_column']}"
+            
+            graph.add_edge(
+                table_name,
+                relation["target_table"],
+                relation="foreign_key",
+                source_column=relation["source_column"],
+                target_column=relation["target_column"]
+            )
+            
+            # Relationship text for embeddings
+            rel_text = (
+                f"Foreign Key: {table_name}.{relation['source_column']} → "
+                f"{relation['target_table']}.{relation['target_column']}, "
+                f"Maps to: {relation.get('maps_to', '')}"
+            )
+            embedding = embedding_model([rel_text])[0]
+
+            entries.append({
+                "id": rel_id,
+                "text": rel_text,
+                "embedding": embedding,
+                "metadata": {
+                    "type": "relationship",
+                    "source_table": table_name,
+                    "source_column": relation["source_column"],
+                    "target_table": relation["target_table"],
+                    "target_column": relation["target_column"],
+                    "maps_to": relation.get("maps_to", "")
+                }
+            })
+
+    # Debug: Print sample metadata for verification
+    if entries:
+        print(f"Sample Metadata Entry: {entries[0]['metadata']}")
+
+    # Store embeddings in ChromaDB
+    if entries:
+        chroma_collection.add(
+            ids=[entry["id"] for entry in entries],
+            documents=[entry["text"] for entry in entries],
+            embeddings=[entry["embedding"] for entry in entries],
+            metadatas=[entry["metadata"] for entry in entries]
+        )
     
-class CheckRelevance(BaseModel):
-    relevance: str = Field(description="Is the question relevant to the database?")
-# Utility function to get database schema
-def get_database_schema(engine):
+    return graph
+
+
+# -------------------------- ENHANCED RETRIEVAL ------------------------- #
+def retrieve_context(state: AgentState):
+    state["context"] = hybrid_search(
+        state["question"],
+        schema,
+        chroma_collection,
+        embedding_model,
+        graph,
+        max_results=15
+    )
+    return state
+
+
+from sqlalchemy.sql import text  # Import text for raw SQL queries
+
+def extract_database_schema(engine):
     inspector = inspect(engine)
-    schema = ""
-    for table_name in inspector.get_table_names():
-        schema += f"Table: {table_name}\n"
-        for column in inspector.get_columns(table_name):
-            col_name = column["name"]
-            col_type = str(column["type"])
-            if column.get("primary_key"):
-                col_type += ", Primary Key"
-            if column.get("foreign_keys"):
-                fk = list(column["foreign_keys"])[0]
-                col_type += f", Foreign Key to {fk.column.table.name}.{fk.column.name}"
-            schema += f"- {col_name}: {col_type}\n"
-        schema += "\n"
-    print(f"[DEBUG] Database Schema:\n{schema}")
+    schema = {}
+
+    # Create a connection for executing SQL queries
+    with engine.connect() as connection:
+        tables = inspector.get_table_names()
+
+        for table_name in tables:
+            schema[table_name] = {"columns": [], "relationships": [], "examples": {}}
+            
+            # Extract columns
+            columns = inspector.get_columns(table_name)
+            for column in columns:
+                # Add column details with examples
+                examples = []  # Retrieve examples from the database
+                try:
+                    # Use sqlalchemy.text to create a valid SQL query object
+                    query = text(f"SELECT {column['name']} FROM {table_name} LIMIT 3")
+                    examples = [row[0] for row in connection.execute(query).fetchall()]
+                except Exception as e:
+                    print(f"Failed to fetch examples for {table_name}.{column['name']}: {e}")
+                
+                schema[table_name]["columns"].append({
+                    "name": column["name"],
+                    "type": str(column["type"]).split("(")[0],
+                    "examples": examples
+                })
+
+            # Extract foreign keys
+            foreign_keys = inspector.get_foreign_keys(table_name)
+            for fk in foreign_keys:
+                schema[table_name]["relationships"].append({
+                    "source_column": fk["constrained_columns"][0],
+                    "target_table": fk["referred_table"],
+                    "target_column": fk["referred_columns"][0]
+                })
+
     return schema
 
-# Workflow steps
-def get_current_user(state: AgentState, config: RunnableConfig):
-    user_id = config.get("configurable", {}).get("current_user_id", None)
-    session = SessionLocal()
-    try:
-        user = session.query(User).filter(User.id == int(user_id)).first()
-        state.current_user = user.name if user else "User not found"
-        print(f"[DEBUG] Current user set to: {state.current_user}")
-    finally:
-        session.close()
-    return state
-
-
-def convert_nl_to_sql(state: AgentState, config: RunnableConfig):
-    if state.relevance != "relevant":
-        print("[DEBUG] Question marked as not relevant")
-        state.sql_query = "The question is not relevant to the database."
-        return state
-
-    schema = get_database_schema(engine)
-    question = state.question
-    current_user = state.current_user
-    system = f"""
-    You are an assistant that converts natural language questions into SQL queries based on the following schema:
-
-    Schema:
-    {schema}
-
-    The current user is '{current_user}'. Ensure that all query-related data is scoped to this user.
-
-    Provide only the SQL query without any explanations.
+def keyword_search(query: str, schema: Dict) -> List[str]:
     """
-    human = f"Question: {question}"
-    convert_prompt = ChatPromptTemplate.from_messages([
-        ("system", system),
-        ("human", human),
-    ])
-    llm = ChatOpenAI(temperature=0)
-    sql_generator = convert_prompt | StrOutputParser()
+    Perform keyword search to find schema elements directly matching query keywords.
+    Args:
+        query (str): User's natural language query.
+        schema (Dict): Extracted database schema.
+    Returns:
+        List[str]: List of schema elements matching the query keywords.
+    """
+    keywords = query.lower().split()  # Split the query into individual words
+    matches = []
 
+    for table, details in schema.items():
+        # Match table names
+        if any(keyword in table.lower() for keyword in keywords):
+            matches.append(table)
+
+        # Match column names
+        for column in details["columns"]:
+            if any(keyword in column["name"].lower() for keyword in keywords):
+                matches.append(f"{table}.{column['name']}")
+
+    return matches
+
+
+
+def semantic_search(query: str, chroma_collection, embedding_model, max_results: int = 20) -> List[str]:
+    """
+    Perform semantic search to retrieve schema elements based on embeddings.
+    Args:
+        query (str): User's natural language query.
+        chroma_collection: ChromaDB collection.
+        embedding_model: Embedding model for generating embeddings.
+        max_results (int): Maximum number of results to return.
+    Returns:
+        List[str]: List of schema elements matching the query semantically.
+    """
+    # Generate embedding for the query
+    query_embedding = embedding_model([query])[0]
+    
+    # Query ChromaDB
+    results = chroma_collection.query(query_embeddings=[query_embedding], n_results=max_results)
+    
+    # Extract IDs of matching schema elements
+    return results["ids"][0]
+
+
+def hybrid_search(
+    query: str,
+    schema: Dict,
+    chroma_collection,
+    embedding_model,
+    graph: nx.DiGraph,
+    max_results: int = 20
+) -> List[str]:
+    """
+    Combine keyword search and semantic search for hybrid retrieval.
+    Args:
+        query (str): User's natural language query.
+        schema (Dict): Extracted database schema.
+        chroma_collection: ChromaDB collection.
+        embedding_model: Embedding model for generating embeddings.
+        max_results (int): Maximum number of results to return.
+    Returns:
+        List[str]: Combined results from keyword and semantic search.
+    """
+    # Perform keyword search
+    keyword_matches = keyword_search(query, schema)
+
+    # Perform semantic search
+    semantic_matches = semantic_search(query, chroma_collection, embedding_model, max_results)
+
+    # Combine and deduplicate results
+    combined_matches = list(set(keyword_matches + semantic_matches))
+
+    # Limit results to max_results
+    return combined_matches[:max_results]
+
+
+def assemble_prompt(query: str, context: List[str], graph: nx.DiGraph) -> str:
+    """
+    Build a structured and optimized prompt with schema context, highlighting relevant parts
+    and including enriched metadata like examples and primary keys.
+    """
+    prompt_lines = [
+        "### Task",
+        "Translate the following natural language query into an SQL query:",
+        "",
+        f"### Query\n{query}",
+        "",
+        "### Relevant Schema Information"
+    ]
+
+    # Collect relevant tables and their metadata
+    relevant_tables = set()
+    for node in context:
+        try:
+            if graph.nodes[node]["type"] == "table":
+                relevant_tables.add(node)
+            elif graph.nodes[node]["type"] == "column":
+                relevant_tables.add(graph.nodes[node]["table"])
+        except KeyError:
+            continue  # Skip nodes that lack necessary attributes
+
+    # Add details for relevant tables and columns
+    for table in relevant_tables:
+        table_metadata = graph.nodes[table]
+        primary_keys = table_metadata.get("primary_keys", [])
+        examples = table_metadata.get("examples", {})
+        prompt_lines.append(f"\nTable: {table}")
+        if primary_keys:
+            prompt_lines.append(f"  - Primary Keys: {', '.join(primary_keys)}")
+        if examples:
+            prompt_lines.append(f"  - Examples: {examples}")
+
+        # Add column details
+        for neighbor in graph.neighbors(table):
+            try:
+                if graph.nodes[neighbor]["type"] == "column":
+                    column_metadata = graph.nodes[neighbor]
+                    column_name = neighbor.split(".")[1]
+                    column_type = column_metadata["data_type"]
+                    primary_key = column_metadata.get("primary_key", False)
+                    column_examples = column_metadata.get("examples", [])
+
+                    # Highlight relevant columns
+                    if neighbor in context:
+                        prompt_lines.append(
+                            f"  - {column_name} ({column_type}) [RELEVANT] - "
+                            f"{'Primary Key' if primary_key else ''} "
+                            f"{f'Examples: {column_examples}' if column_examples else ''}"
+                        )
+                    else:
+                        prompt_lines.append(
+                            f"  - {column_name} ({column_type}) - "
+                            f"{'Primary Key' if primary_key else ''} "
+                            f"{f'Examples: {column_examples}' if column_examples else ''}"
+                        )
+            except KeyError:
+                continue
+
+    # Add relevant relationships
+    prompt_lines.append("\n### Relationships")
+    for edge in graph.edges(data=True):
+        if edge[2].get("relation") == "foreign_key":
+            source = edge[0]
+            target = edge[1]
+            source_col = edge[2]["source_column"]
+            target_col = edge[2]["target_column"]
+            maps_to = edge[2].get("maps_to", "")
+            relationship_examples = edge[2].get("examples", [])
+            if source in relevant_tables or target in relevant_tables:
+                prompt_lines.append(
+                    f"  - {source} ({source_col}) → {target} ({target_col}) [RELEVANT] "
+                    f"{f'Maps to: {maps_to}' if maps_to else ''} "
+                    f"{f'Examples: {relationship_examples}' if relationship_examples else ''}"
+                )
+
+    # Final instructions
+    prompt_lines.append("\n### SQL Query")
+    prompt_lines.append("-- Write the SQL query below this line --")
+    print(f"Assemble Prompt: {prompt_lines}")
+    return "\n".join(prompt_lines)
+
+
+COLLECTION_NAME = 'schema_embeddings'
+
+def setup_chroma_db():
+    """
+    Initialize ChromaDB and ensure collection matches embedding dimension
+    """
+    schema = extract_database_schema(engine)
+    
+    chroma_client = PersistentClient(path=CHROMA_DB_DIR)
     try:
-        response = sql_generator.invoke({})
-        if isinstance(response, str):
-            state.sql_query = response.strip()
-        else:
-            raise ValueError("Unexpected response format from LLM.")
-        print(f"[DEBUG] SQL Query Generated: {state.sql_query}")
-    except Exception as e:
-        print(f"[ERROR] Error in convert_nl_to_sql: {e}")
-        state.sql_query = "Error generating SQL query."
-    return state
+        # Try to get the collection
+        collection = chroma_client.get_collection(COLLECTION_NAME)
+    except Exception:
+        # Create collection with correct embedding function and dimension
+        collection = chroma_client.create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=ThaiBGEEmbeddingFunction()
+        )
+    return chroma_client, collection
 
-def execute_sql(state: AgentState):
-    if "Error" in state.sql_query or "not relevant" in state.sql_query:
-        print("[DEBUG] Skipping execution: Invalid SQL query.")
-        state.query_rows = []
-        return state
 
-    session = SessionLocal()
-    try:
-        print(f"[DEBUG] Executing SQL Query: {state.sql_query}")
-        result = session.execute(text(state.sql_query))
-        state.query_rows = result.fetchall()
-        print(f"[DEBUG] Query Rows: {state.query_rows}")
-    except Exception as e:
-        print(f"[ERROR] Error executing SQL query: {e}")
-        state.query_rows = []
-    finally:
-        session.close()
-    return state
 
-def generate_human_readable_answer(state: AgentState):
-    rows = state.query_rows
-    current_user = state.current_user
-    state.query_result = (
-        f"Hello {current_user}, found {len(rows)} rows." if rows else f"Hello {current_user}, no data found."
+schema = extract_database_schema(engine)
+chroma_client, chroma_collection = setup_chroma_db()
+embedding_model = ThaiBGEEmbeddingFunction()
+graph = process_schema_to_graph_and_embeddings(schema, chroma_collection, embedding_model)
+
+from langchain_core.prompts.chat import ChatPromptTemplate
+
+def check_relevance(state: AgentState, config: dict):
+    """Determine if the user's question is relevant to the database schema using context-based retrieval."""
+    question = state["question"]
+    
+    # Retrieve relevant schema context using hybrid search
+    state["context"] = hybrid_search(
+        question,
+        schema,  # Extracted database schema
+        chroma_collection,
+        embedding_model,
+        graph,
+        max_results=15  # Retrieve top 15 relevant elements
     )
-    print(f"[DEBUG] Generated Answer: {state.query_result}")
+
+    # If no relevant schema elements were found, mark as 'not_relevant'
+    if not state["context"]:
+        state["relevance"] = "not_relevant"
+        print("[DEBUG] No relevant schema context found. Marking as not relevant.")
+        return state
+    print(f"[DEBUG] Retrieved relevant schema context: {state['context']}")
+    # Construct prompt with retrieved schema context
+    system_prompt = f"""
+    You are an intelligent assistant determining if a given question is related to a database schema.
+
+    - If the question is **clearly related** to the database (queries about data, tables, or relationships), respond `"relevant"`.
+    - If the question is **unrelated** (about the weather, general facts, jokes, etc.), respond `"not_relevant"`.
+
+    **Database Schema Context (Most Relevant Retrieved Entries):**
+    {state["context"]}
+
+    **Example Scenarios:**
+    - User Question: "What is the weather today?"
+      Response: "not_relevant"
+    - User Question: "Show me all coupons and their discount."
+      Response: "relevant"
+
+    **User Question:**
+    {question}
+    """
+
+    # LLM call to determine relevance
+    llm = AzureChatOpenAI(
+        temperature=0,
+        azure_endpoint=os.getenv("OPENAI_API_ENDPOINT"),
+        openai_api_version=os.getenv("OPENAI_API_VERSION"),
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        deployment_name=os.getenv("OPENAI_DEPLOYMENT_NAME")
+    )
+
+    response = llm([SystemMessage(content=system_prompt)])
+
+    # Extract response and update state
+    state["relevance"] = response.content.strip().lower()
+    print(f"[DEBUG] LLM determined relevance as: {state['relevance']}")
+
     return state
 
-# Workflow definition
-class TextToSQLFlow:
-    def __init__(self):
-        self.state = AgentState()
-        self.config = {}
 
-    def kickoff(self):
-        self.state = get_current_user(self.state, self.config)
-        self.state = check_relevance(self.state, self.config)
-        self.state = convert_nl_to_sql(self.state, self.config)
-        self.state = execute_sql(self.state)
-        self.state = generate_human_readable_answer(self.state)
-        return self.state
+def setup_chroma_db():
+    """
+    Initialize ChromaDB and ensure collection matches embedding dimension
+    """
+    schema = extract_database_schema(engine)
+    
+    chroma_client = PersistentClient(path=CHROMA_DB_DIR)
+    try:
+        # Try to get the collection
+        collection = chroma_client.get_collection(COLLECTION_NAME)
+    except Exception:
+        # Create collection with correct embedding function and dimension
+        collection = chroma_client.create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=ThaiBGEEmbeddingFunction()
+        )
+    return chroma_client, collection
 
-# Example usage
-if __name__ == "__main__":
-    flow = TextToSQLFlow()
-    flow.state.question = "Show me all delivery information for user 10 and orders."
-    flow.config = {"configurable": {"current_user_id": "10"}}
-    final_state = flow.kickoff()
-    print("Final Output:", final_state.query_result)
+def extract_database_schema(engine):
+    """Extracts database schema details for use in SQL generation."""
+    inspector = inspect(engine)
+    schema = {}
+    with engine.connect() as connection:
+        tables = inspector.get_table_names()
+        for table_name in tables:
+            schema[table_name] = {"columns": [], "relationships": [], "examples": {}}
+            columns = inspector.get_columns(table_name)
+            for column in columns:
+                examples = []
+                try:
+                    query = text(f"SELECT {column['name']} FROM {table_name} LIMIT 3")
+                    examples = [row[0] for row in connection.execute(query).fetchall()]
+                except Exception as e:
+                    print(f"Failed to fetch examples for {table_name}.{column['name']}: {e}")
+                schema[table_name]["columns"].append({
+                    "name": column["name"],
+                    "type": str(column["type"]).split("(")[0],
+                    "examples": examples
+                })
+            foreign_keys = inspector.get_foreign_keys(table_name)
+            for fk in foreign_keys:
+                schema[table_name]["relationships"].append({
+                    "source_column": fk["constrained_columns"][0],
+                    "target_table": fk["referred_table"],
+                    "target_column": fk["referred_columns"][0]
+                })
+    return schema
+
+
+# -------------------------- Schema Context Retrieval -------------------------- #
+
+
+def get_database_schema(context, graph):
+    """
+    Extracts relevant schema information based on the provided context.
+    
+    Args:
+        context (List[str]): List of relevant schema elements retrieved via hybrid search.
+        graph (nx.DiGraph): Graph representation of the database schema.
+    
+    Returns:
+        str: A formatted string containing relevant schema information.
+    """
+    prompt_lines = ["### Relevant Schema Information"]
+    
+    relevant_tables = set()
+    
+    # Identify relevant tables from context
+    for node in context:
+        try:
+            if graph.nodes[node]["type"] == "table":
+                relevant_tables.add(node)
+            elif graph.nodes[node]["type"] == "column":
+                relevant_tables.add(graph.nodes[node]["table"])
+        except KeyError:
+            continue  # Skip nodes that lack necessary attributes
+    
+    # Add table details
+    for table in relevant_tables:
+        table_metadata = graph.nodes[table]
+        primary_keys = table_metadata.get("primary_keys", [])
+        examples = table_metadata.get("examples", {})
+        prompt_lines.append(f"\nTable: {table}")
+        if primary_keys:
+            prompt_lines.append(f"  - Primary Keys: {', '.join(primary_keys)}")
+        if examples:
+            prompt_lines.append(f"  - Examples: {examples}")
+
+        # Add column details
+        for neighbor in graph.neighbors(table):
+            try:
+                if graph.nodes[neighbor]["type"] == "column":
+                    column_metadata = graph.nodes[neighbor]
+                    column_name = neighbor.split(".")[1]
+                    column_type = column_metadata["data_type"]
+                    primary_key = column_metadata.get("primary_key", False)
+                    column_examples = column_metadata.get("examples", [])
+
+                    # Highlight relevant columns
+                    if neighbor in context:
+                        prompt_lines.append(
+                            f"  - {column_name} ({column_type}) [RELEVANT] - "
+                            f"{'Primary Key' if primary_key else ''} "
+                            f"{f'Examples: {column_examples}' if column_examples else ''}"
+                        )
+                    else:
+                        prompt_lines.append(
+                            f"  - {column_name} ({column_type}) - "
+                            f"{'Primary Key' if primary_key else ''} "
+                            f"{f'Examples: {column_examples}' if column_examples else ''}"
+                        )
+            except KeyError:
+                continue
+
+    # Add relevant relationships
+    prompt_lines.append("\n### Relationships")
+    for edge in graph.edges(data=True):
+        if edge[2].get("relation") == "foreign_key":
+            source = edge[0]
+            target = edge[1]
+            source_col = edge[2]["source_column"]
+            target_col = edge[2]["target_column"]
+            maps_to = edge[2].get("maps_to", "")
+            relationship_examples = edge[2].get("examples", [])
+            if source in relevant_tables or target in relevant_tables:
+                prompt_lines.append(
+                    f"  - {source} ({source_col}) → {target} ({target_col}) [RELEVANT] "
+                    f"{f'Maps to: {maps_to}' if maps_to else ''} "
+                    f"{f'Examples: {relationship_examples}' if relationship_examples else ''}"
+                )
+
+    return "\n".join(prompt_lines)
+
+
